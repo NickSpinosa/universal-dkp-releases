@@ -1,0 +1,256 @@
+# The release workflow of the public NickSpinosa/universal-dkp-releases
+# repository, kept here so it's versioned with the code it builds. Copy it to
+# .github/workflows/release.yml there (release-ci/setup.sh does).
+#
+# It builds one part of Universal DKP from this private repository and
+# publishes it from the public one, where Actions runners are free and the
+# tray app can read the releases without signing in:
+#
+#   uploader  udkp-uploader.exe and udkp-tray.exe as the release
+#             uploader-v<version>, marked latest (the tray app updates itself
+#             from the latest release, uploader/src/update.rs). Version:
+#             uploader/Cargo.toml.
+#   server    Docker image of the web app (API + frontend), pushed to
+#             ghcr.io/nickspinosa/udkp-web:<version> and :latest. Version:
+#             web-app/backend/Cargo.toml.
+#   addon     Minified addon zip (UniversalDKP-<version>.zip) as the release
+#             addon-v<version>, not marked latest, and to CurseForge once
+#             that's set up (see the addon job). Version: "## Version:" in
+#             addon/UniversalDKP.toc.
+#
+# Runs only when started by hand (release-ci/release.sh starts it with
+# `gh workflow run`). Never on pushes or pull requests: this repository is
+# public, so its logs are too, and only people with write access can start a
+# manual run. No build caches either: pull requests from forks can read a
+# public repository's caches.
+#
+# Needs, in the `release` environment:
+#   UDKP_SOURCE_KEY       read-only deploy key of NickSpinosa/Universal_DKP
+#                         (SSH, private half)
+# and optionally, for CurseForge:
+#   CURSEFORGE_API_TOKEN  secret
+#   CURSEFORGE_PROJECT_ID, CURSEFORGE_GAME_VERSIONS  variables
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      component:
+        description: What to release
+        type: choice
+        options: [uploader, server, addon]
+        required: true
+      ref:
+        description: Commit, branch or tag of NickSpinosa/Universal_DKP to release
+        required: true
+        default: main
+      publish:
+        description: Publish the release (off is a dry run that only builds and tests)
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ inputs.component }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+  SOURCE_REPO: NickSpinosa/Universal_DKP
+
+jobs:
+  uploader:
+    if: inputs.component == 'uploader'
+    runs-on: windows-latest
+    environment: release
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.UDKP_SOURCE_KEY }}
+          persist-credentials: false
+
+      - run: rustup toolchain install stable --profile minimal
+
+      - name: Version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | python -c "import json,sys; print(next(p['version'] for p in json.load(sys.stdin)['packages'] if p['name']=='udkp-uploader'))")
+          tag="uploader-v$version"
+          if ${{ inputs.publish }} && gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$tag is already released; bump uploader/Cargo.toml"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - name: Test
+        run: cargo test --locked -p udkp-uploader
+
+      - name: Build
+        run: cargo build --locked --release -p udkp-uploader --bins
+
+      - name: Publish
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.version.outputs.tag }}
+        run: |
+          gh release create "$TAG" \
+            target/release/udkp-tray.exe \
+            target/release/udkp-uploader.exe \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Uploader ${TAG#uploader-}" \
+            --notes "Built from $SOURCE_REPO at $(git rev-parse --short HEAD)." \
+            --latest
+
+  server:
+    if: inputs.component == 'server'
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 60
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.UDKP_SOURCE_KEY }}
+          persist-credentials: false
+
+      - name: Image name and tags
+        id: image
+        run: |
+          version=$(cargo metadata --no-deps --format-version 1 \
+            | jq -r '.packages[] | select(.name == "udkp-web") | .version')
+          image="ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/udkp-web"
+          echo "tags=$image:$version,$image:latest" >> "$GITHUB_OUTPUT"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: docker/login-action@v3
+        if: inputs.publish
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ github.token }}
+
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: web-app/Dockerfile
+          push: ${{ inputs.publish }}
+          tags: ${{ steps.image.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.title=udkp-web
+
+  addon:
+    if: inputs.component == 'addon'
+    runs-on: ubuntu-latest
+    environment: release
+    timeout-minutes: 60
+    services:
+      # For the harness's pipeline and settlement tests.
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: udkp
+          POSTGRES_PASSWORD: udkp
+          POSTGRES_DB: udkp
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready --health-interval 5s --health-timeout 5s --health-retries 10
+    env:
+      # The CurseForge upload runs once the CURSEFORGE_PROJECT_ID variable is set.
+      CURSEFORGE_PROJECT_ID: ${{ vars.CURSEFORGE_PROJECT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.UDKP_SOURCE_KEY }}
+          persist-credentials: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Package
+        id: package
+        working-directory: addon/package
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          npm ci
+          npm run build | tee "$RUNNER_TEMP/build.log"
+          grep -E '^(version|zip)=' "$RUNNER_TEMP/build.log" >> "$GITHUB_OUTPUT"
+          tag="addon-v$(sed -n 's/^version=//p' "$RUNNER_TEMP/build.log")"
+          if ${{ inputs.publish }} && gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "::error::$tag is already released; bump ## Version: in addon/UniversalDKP.toc"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+
+      - run: rustup toolchain install stable --profile minimal
+
+      - name: Test the minified addon
+        env:
+          UDKP_ADDON_DIR: ${{ github.workspace }}/addon/package/dist/UniversalDKP
+          DATABASE_URL: postgres://udkp:udkp@localhost:5432/udkp
+        run: cargo test --locked -p udkp-addon-harness
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: addon
+          path: ${{ steps.package.outputs.zip }}
+
+      - name: Publish to GitHub
+        if: inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.package.outputs.tag }}
+          ZIP: ${{ steps.package.outputs.zip }}
+        run: |
+          gh release create "$TAG" "$ZIP" \
+            --repo "$GITHUB_REPOSITORY" \
+            --title "Addon ${TAG#addon-}" \
+            --notes "Built from $SOURCE_REPO at $(git rev-parse --short HEAD)." \
+            --latest=false
+
+      # Untested until the CurseForge project exists. gameVersions takes
+      # CurseForge's ids for game versions (GET
+      # https://wow.curseforge.com/api/game/versions with the token); put them
+      # in the variable CURSEFORGE_GAME_VERSIONS as a JSON array.
+      - name: Publish to CurseForge
+        if: inputs.publish && env.CURSEFORGE_PROJECT_ID != ''
+        env:
+          CURSEFORGE_API_TOKEN: ${{ secrets.CURSEFORGE_API_TOKEN }}
+          GAME_VERSIONS: ${{ vars.CURSEFORGE_GAME_VERSIONS || '[]' }}
+          VERSION: ${{ steps.package.outputs.version }}
+          TAG: ${{ steps.package.outputs.tag }}
+          ZIP: ${{ steps.package.outputs.zip }}
+        run: |
+          metadata=$(jq -nc \
+            --arg name "Universal DKP $VERSION" \
+            --arg changelog "See $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG" \
+            --argjson versions "$GAME_VERSIONS" \
+            '{displayName: $name, changelog: $changelog, changelogType: "markdown",
+              gameVersions: $versions, releaseType: "release"}')
+          curl --fail-with-body -sS \
+            -H "X-Api-Token: $CURSEFORGE_API_TOKEN" \
+            -F "metadata=$metadata" \
+            -F "file=@$ZIP" \
+            "https://wow.curseforge.com/api/projects/$CURSEFORGE_PROJECT_ID/upload-file"
